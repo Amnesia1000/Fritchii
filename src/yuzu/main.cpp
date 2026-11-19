@@ -21,6 +21,9 @@
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/lowend_sim.h"
+#ifdef _WIN32
+#include "common/windows/crash_handler.h"
+#endif
 #include "common/shutdown_watch.h"
 #include "startup_checks.h"
 
@@ -428,6 +431,12 @@ static void LoadNx2Switches(const char* argv0) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    // The helper process of a fatal error's report: it writes the dump and ends here.
+    if (int helper_exit_code = 0; Common::Windows::RunDumpHelper(helper_exit_code)) {
+        return helper_exit_code;
+    }
+#endif
 #ifdef ENABLE_UPDATE_CHECKER
     // Before the switches are added to the environment, which a restart must not inherit.
     Updater::PrepareLaunch();

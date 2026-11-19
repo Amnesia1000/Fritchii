@@ -881,6 +881,13 @@ them. Exact: the same code, more room. Memory is committed only as code is writt
 per core, 4-6 cores). Log: "FRITCHII_JIT_CACHE_MIB=N: code cache of N MiB per core". Only worth a
 test when FRITCHII_HITCH_SPLIT=1 shows "warm compiles refused" before the load; judge by the load
 cluster's hitch score and its "another core had" time, fresh launches (boot setting).
+### FRITCHII_TEST_DEVICE_LOSS
+
+TEST, off by default (live, debug server only). 1 = the next queue submission goes through the
+device loss report without a real loss: the "Device loss" lines, every thread's stack, the "Host
+crash" line, eden_crash.dmp from the helper process, then the process ends with code 2. It should
+take a few seconds. Never set it in nx2_switches.txt.
+
 ### FRITCHII_SMALL_CARD, FRITCHII_SMALL_CARD_PARTS, FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB
 
 TEST, off by default (helper BY, 2026-11-16). FRITCHII_SMALL_CARD (live): 0 off, 1 on, 2 auto = on

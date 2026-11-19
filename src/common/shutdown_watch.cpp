@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #include <fmt/format.h>
@@ -263,6 +264,21 @@ void End() {
 
 void EndProcessNow() {
     EndProcess();
+}
+
+void EndProcessAfter(std::chrono::seconds delay) {
+    try {
+        std::thread([delay] {
+            std::this_thread::sleep_for(delay);
+            // No log flush here: the log may be what is stuck.
+#ifdef _WIN32
+            TerminateProcess(GetCurrentProcess(), 2);
+#endif
+            std::_Exit(2);
+        }).detach();
+    } catch (const std::system_error&) {
+        // No thread to be had: the caller goes on without the safety net.
+    }
 }
 
 } // namespace Common::ShutdownWatch

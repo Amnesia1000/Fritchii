@@ -1325,6 +1325,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         case VK_SUCCESS:
             // FRITCHII_SLOW_GPU: the CPU side of the queue wait estimate; one compare when off.
             slow_gpu.Submitted(signal_value, slow_call_ns);
+            if (VideoCore::Nx2Debug::g_test_device_loss.load(std::memory_order_relaxed) != 0)
+                [[unlikely]] {
+                device.ReportLoss();
+            }
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
                 Settings::values.gpu_log_vulkan_calls.GetValue()) {

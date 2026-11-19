@@ -536,6 +536,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_SMALL_CARD") {
         return &SmallCard::g_small_card;
     }
+    if (name == "FRITCHII_TEST_DEVICE_LOSS") {
+        return &g_test_device_loss;
+    }
     if (name == "FRITCHII_SIM_GPU_SLOW") {
         return &Common::LowEndSim::g_gpu_slow;
     }

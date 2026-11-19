@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <source_location>
 #include <span>
 #include <string>
 #include "common/container/unordered_map.h"
@@ -257,8 +258,9 @@ public:
     bool IsFormatSupported(VkFormat wanted_format, VkFormatFeatureFlags wanted_usage,
                            FormatType format_type) const;
 
-    /// Reports a device loss.
-    void ReportLoss() const;
+    /// Reports a device loss and ends the process. It never returns: the first thread to get here
+    /// writes the report, any other waits for the end.
+    void ReportLoss(std::source_location where = std::source_location::current()) const;
 
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;

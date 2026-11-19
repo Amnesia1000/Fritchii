@@ -34,6 +34,11 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/shutdown_watch.h"
+#ifdef _WIN32
+#include "common/windows/crash_handler.h"
+#elif defined(__linux__)
+#include "common/linux/crash_handler.h"
+#endif
 #include "video_core/churn_counters.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
@@ -1655,7 +1660,7 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
     return wanted_format;
 }
 
-void Device::ReportLoss() const {
+void Device::ReportLoss(std::source_location where) const {
     // The first thread to see the loss reports it and ends the process; the others wait for that.
     static std::atomic_flag reported;
     if (reported.test_and_set()) {
@@ -1663,17 +1668,38 @@ void Device::ReportLoss() const {
             std::this_thread::sleep_for(std::chrono::hours{1});
         }
     }
-    LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+    // The report touches the driver, the log and every thread's stack, on a process in an unknown
+    // state: whatever gets stuck, the process still ends and the player gets no frozen window.
+    Common::ShutdownWatch::EndProcessAfter(std::chrono::seconds{nsight_aftermath_tracker ? 50 : 35});
+    u64 heap_size{};
+    u64 heap_usage{};
+    u64 heap_budget{};
+    const bool has_heap = MainHeapNumbers(heap_size, heap_usage, heap_budget);
+    LOG_CRITICAL(Render_Vulkan,
+                 "Device loss occurred! Seen at {}:{}; GPU {}, driver {} ({:#x}); video memory {}",
+                 where.file_name(), where.line(), GetModelName(), GetDriverName(),
+                 GetDriverVersion(),
+                 has_heap ? fmt::format("{} MiB used of {} MiB, budget {} MiB", heap_usage >> 20,
+                                        heap_size >> 20, heap_budget >> 20)
+                          : std::string{"unknown"});
     PipelineBinary::NoteDeviceLoss();
     ReportDeviceFault();
     // FRITCHII_SLOW_GPU: what the GPU was last given (NVIDIA's fault info has no addresses).
     Common::Nx2Hitch::LogGpuBreadcrumbs("Device loss");
+    // What every thread was doing, as a hang report gives it.
+    Common::Nx2Hitch::LogThreadReport("Device loss", false, 0);
 
     if (nsight_aftermath_tracker) {
         // Give Nsight Aftermath time to write its dump.
         std::this_thread::sleep_for(std::chrono::seconds{15});
     }
-    LOG_CRITICAL(Render_Vulkan, "Closing Fritchii: the GPU driver lost the Vulkan device");
+    static constexpr const char* FatalError = "the GPU driver lost the Vulkan device";
+#ifdef _WIN32
+    Common::Windows::ReportFatalError(FatalError);
+#elif defined(__linux__)
+    Common::Linux::LogFatalError(FatalError);
+#endif
+    LOG_CRITICAL(Render_Vulkan, "Closing Fritchii: {}", FatalError);
     // Flushes the log and skips DLL detach, which would run the driver's teardown on the lost
     // device. An exception from here would only reach std::terminate on a worker thread.
     Common::ShutdownWatch::EndProcessNow();
