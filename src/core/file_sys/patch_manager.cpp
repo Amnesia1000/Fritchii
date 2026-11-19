@@ -1478,6 +1478,58 @@ constexpr std::array BUILTIN_PATCHES{
     },
 };
 
+// The JIT translates only these system registers (dynarmic's A64 impl/system.cpp): an MRS or MSR
+// of any other ends the game with "unreachable" the first time the patched code runs, which no
+// test sees until a game reaches that code (the texture heap stub's CNTVCT_EL0, 2026-11-19). So
+// every word of every built-in patch is checked here, at build time. Words are compared with
+// their register field (Rt) cleared.
+constexpr bool PatchWordRunsOnJit(u32 word) {
+    const u32 no_rt = word & ~u32{0x1F};
+    if ((word & 0xFFF00000U) == 0xD5300000U) { // MRS
+        constexpr std::array<u32, 9> readable{
+            0xD53BE000U, // CNTFRQ_EL0
+            0xD53BE020U, // CNTPCT_EL0
+            0xD53B0020U, // CTR_EL0
+            0xD53B00E0U, // DCZID_EL0
+            0xD53B4400U, // FPCR
+            0xD53B4420U, // FPSR
+            0xD53B4200U, // NZCV
+            0xD53BD040U, // TPIDR_EL0
+            0xD53BD060U, // TPIDRRO_EL0
+        };
+        return std::ranges::find(readable, no_rt) != readable.end();
+    }
+    if ((word & 0xFFF00000U) == 0xD5100000U) { // MSR (register)
+        constexpr std::array<u32, 4> writable{
+            0xD51B4400U, // FPCR
+            0xD51B4420U, // FPSR
+            0xD51B4200U, // NZCV
+            0xD51BD040U, // TPIDR_EL0
+        };
+        return std::ranges::find(writable, no_rt) != writable.end();
+    }
+    return true;
+}
+static_assert(!PatchWordRunsOnJit(0xD53BE049U), "CNTVCT_EL0 must be refused");
+static_assert(PatchWordRunsOnJit(0xD53BE029U), "CNTPCT_EL0 must pass");
+static_assert(std::ranges::all_of(BUILTIN_PATCHES, [](const BuiltinPatch& patch) {
+                  return std::ranges::all_of(patch.records, [](const BuiltinPatchRecord& record) {
+                      if (record.module_offset % 4 != 0 || record.bytes.size() % 4 != 0) {
+                          return true;
+                      }
+                      for (size_t i = 0; i < record.bytes.size(); i += 4) {
+                          const u32 word = u32{record.bytes[i]} | (u32{record.bytes[i + 1]} << 8) |
+                                           (u32{record.bytes[i + 2]} << 16) |
+                                           (u32{record.bytes[i + 3]} << 24);
+                          if (!PatchWordRunsOnJit(word)) {
+                              return false;
+                          }
+                      }
+                      return true;
+                  });
+              }),
+              "a built-in patch reads or writes a system register the JIT does not translate");
+
 // Whether [offset, offset + size) of a module (offsets after its NSO header) lies in its BSS.
 bool InModuleBss(const Loader::NSOHeader& header, u64 offset, u64 size) {
     const auto& data = header.segments[2];
