@@ -12,6 +12,7 @@
 #include "common/nx2_hitch.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "video_core/link_stats.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -163,6 +164,9 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    const bool link_stats = VideoCommon::LinkStats::On();
+    const auto wait_start =
+        link_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     try {
         while (!semaphore.Wait(tick)) {
         }
@@ -173,6 +177,12 @@ void MasterSemaphore::Wait(u64 tick) {
         // The throw ends the process; say why first.
         LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick, exception.what());
         throw;
+    }
+    if (link_stats) [[unlikely]] {
+        VideoCommon::LinkStats::NoteWait(static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count()));
     }
 
     Refresh();

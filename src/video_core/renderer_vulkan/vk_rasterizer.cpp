@@ -79,6 +79,9 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/link_stats.h"
+#include "video_core/renderer_vulkan/vk_pcie_link.h"
+#include "video_core/renderer_vulkan/vk_sim_link_hog.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -585,13 +588,16 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     : gpu{gpu_}, device_memory{device_memory_}, device{device_},
       memory_allocator{memory_allocator_}, state_tracker{state_tracker_}, scheduler{scheduler_},
       staging_pool(device, memory_allocator, scheduler,
-                   device.HasSplitAllocators() && device.IsIntegrated() ? 2 : 1),
+                   device.HasSplitAllocators() && device.IsIntegrated() ? 2 : 1,
+                   device.HasSplitAllocators() ? StagingBufferPool::StreamRole::Transfers
+                                               : StagingBufferPool::StreamRole::Everything),
       split_buffer_allocator{device.HasSplitAllocators()
                                  ? std::make_unique<MemoryAllocator>(device, true)
                                  : nullptr},
       split_buffer_staging{split_buffer_allocator ? std::make_unique<StagingBufferPool>(
                                                         device, *split_buffer_allocator,
-                                                        scheduler, 2)
+                                                        scheduler, 2,
+                                                        StagingBufferPool::StreamRole::Buffers)
                                                   : nullptr},
       buffer_memory_allocator{split_buffer_allocator ? *split_buffer_allocator
                                                      : memory_allocator},
@@ -639,6 +645,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     }
     // FRITCHII_STAGING_RING: the texture cache's pool (texture uploads at area loads).
     staging_pool.CreateUploadRing();
+    if (!device.IsIntegrated()) {
+        LogPcieLink(device.GetVendorID(), device.GetDeviceID());
+    }
+    // FRITCHII_SIM_LINK_HOG: a copy load on the transfer queue (test).
+    if (device.HasLinkHogQueue()) {
+        sim_link_hog = std::make_unique<SimLinkHog>(device, memory_allocator);
+    }
     VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
@@ -9763,6 +9776,7 @@ void RasterizerVulkan::TickFrame() {
     if (split_buffer_staging) {
         split_buffer_staging->TickFrame();
     }
+    VideoCommon::LinkStats::MaybeLog();
     part_done(FrameEndTimes::Staging);
     {
         std::scoped_lock lock{texture_cache.mutex};

@@ -548,6 +548,18 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_SIM_GPU_SLOW") {
         return &Common::LowEndSim::g_gpu_slow;
     }
+    if (name == "FRITCHII_SIM_LINK") {
+        return &Common::LowEndSim::g_link_mbps;
+    }
+    if (name == "FRITCHII_SIM_LINK_LOAD") {
+        return &Common::LowEndSim::g_link_load_mbps;
+    }
+    if (name == "FRITCHII_SIM_LINK_US") {
+        return &Common::LowEndSim::g_link_us;
+    }
+    if (name == "FRITCHII_SIM_LINK_HOG") {
+        return &Common::LowEndSim::g_link_hog_mibs;
+    }
     if (name == "FRITCHII_SIM_CPU_SLOW") {
         return &Common::LowEndSim::g_cpu_slow;
     }
@@ -646,6 +658,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_STAGING_RING") {
         return &g_staging_ring;
+    }
+    if (name == "FRITCHII_LINK_STATS") {
+        return &g_link_stats;
     }
     if (name == "FRITCHII_ZERO_UPLOAD") {
         return &g_zero_upload;

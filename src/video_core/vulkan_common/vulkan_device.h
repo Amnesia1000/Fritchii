@@ -359,6 +359,25 @@ public:
     /// queues or more). Decided once, before the device is made.
     bool WantsSideQueue() const;
 
+    /// FRITCHII_SIM_LINK_HOG: the queue family the copy load gets. Decided once, before the
+    /// device is made.
+    [[nodiscard]] std::optional<u32> LinkHogFamily() const;
+
+    /// FRITCHII_SIM_LINK_HOG (boot, test): a queue of a transfer family for the copy load.
+    vk::Queue GetLinkHogQueue() const {
+        return link_hog_queue;
+    }
+    bool HasLinkHogQueue() const {
+        return has_link_hog_queue;
+    }
+    u32 GetLinkHogFamily() const {
+        return link_hog_family;
+    }
+
+    /// FRITCHII_DESCRIPTOR_SETS (boot): draws and dispatches take descriptor sets from pools
+    /// instead of push descriptors or the descriptor buffer ring. Decided once.
+    [[nodiscard]] bool PrefersDescriptorSets() const;
+
     /// Returns main graphics queue family index.
     u32 GetGraphicsFamily() const {
         return graphics_family;
@@ -1516,6 +1535,9 @@ private:
     vk::Queue present_queue;     ///< Main present queue.
     vk::Queue side_queue;        ///< FRITCHII_READ_SIDE_COPY >= 2: graphics family, index 1.
     bool has_side_queue{};
+    vk::Queue link_hog_queue;    ///< FRITCHII_SIM_LINK_HOG: a transfer family's queue.
+    bool has_link_hog_queue{};
+    u32 link_hog_family{};
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.

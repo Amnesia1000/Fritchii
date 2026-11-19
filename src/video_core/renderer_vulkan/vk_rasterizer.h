@@ -94,6 +94,8 @@ private:
     Scheduler& scheduler;
 };
 
+class SimLinkHog;
+
 class RasterizerVulkan final : public VideoCore::RasterizerInterface,
                                protected VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
 public:
@@ -803,6 +805,8 @@ private:
     SetupKeep setup_keep{};
     /// GPUMem: the raw handles of the draw it fills (SEAM 3).
     std::vector<u32> stage_handle_values;
+    /// FRITCHII_SIM_LINK_HOG: last member, so its thread ends before anything else goes.
+    std::unique_ptr<SimLinkHog> sim_link_hog;
 };
 
 } // namespace Vulkan
