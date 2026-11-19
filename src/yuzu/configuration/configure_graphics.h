@@ -101,6 +101,8 @@ private:
     void UpdatePictureMenu();
     /// Fritchii builds: the resolution list's names, as heights for the Max Resolution choice.
     void UpdateResolutionNames();
+    /// The height of the screen this window is on, in pixels (0 = unknown).
+    [[nodiscard]] u32 ScreenHeight() const;
     /// OoT's Max Resolution add-on as this page has it now (without a picture menu: as saved).
     [[nodiscard]] bool MaxResolutionNow() const;
     /// Fritchii builds: the short status line under the picture rows: what the choices make, why

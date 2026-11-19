@@ -1448,11 +1448,16 @@ void ConfigureGraphics::UpdatePictureMenu() {
                                         "the game's own size."));
 
     output_combobox->clear();
+    const u32 screen = ScreenHeight();
     for (const u32 height : PictureOutputsNow()) {
         // The scene's own size: anti-aliasing only (DLSS Native, FSR at 1x).
-        output_combobox->addItem(height == scene ? tr("%1 Native").arg(HeightName(height))
-                                                 : HeightName(height),
-                                 height);
+        QString name =
+            height == scene ? tr("%1 Native").arg(HeightName(height)) : HeightName(height);
+        // Anything bigger is shrunk again to fit: the size that costs no more than it shows.
+        if (height == screen) {
+            name = tr("%1 (your screen)").arg(name);
+        }
+        output_combobox->addItem(name, height);
     }
     output_combobox->setCurrentIndex(output_combobox->findData(output));
     output_combobox->setEnabled(output_combobox->count() > 1);
@@ -1463,6 +1468,13 @@ void ConfigureGraphics::UpdatePictureMenu() {
     } else {
         output_row->setToolTip(tr("This Resolution makes only this size."));
     }
+}
+
+u32 ConfigureGraphics::ScreenHeight() const {
+    const QScreen* const screen = window() != nullptr ? window()->screen() : nullptr;
+    return screen != nullptr
+               ? static_cast<u32>(qRound(screen->size().height() * screen->devicePixelRatio()))
+               : 0;
 }
 
 bool ConfigureGraphics::MaxResolutionNow() const {
@@ -1644,11 +1656,7 @@ void ConfigureGraphics::UpdateWindowFilterNote() {
         const u32 base = Settings::IsDockedMode() && MaxResolutionNow() ? 1440U : 1080U;
         picture = base * info.up_scale >> info.down_shift;
     }
-    const QScreen* const screen = window() != nullptr ? window()->screen() : nullptr;
-    const u32 screen_height =
-        screen != nullptr ? static_cast<u32>(qRound(screen->size().height() *
-                                                    screen->devicePixelRatio()))
-                          : 0;
+    const u32 screen_height = ScreenHeight();
 
     // Bigger or smaller by more than 5%, as the Auto filter decides (present.h).
     const bool known = picture != 0 && screen_height != 0;
