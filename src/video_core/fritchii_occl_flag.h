@@ -31,7 +31,16 @@ namespace VideoCommon::OcclFlag {
 /// to measure what the colour variants add.
 /// 4 (COST PROBE, wrong picture possible): as 3, and colour-off draws whose pixel program
 /// discards take the host flag variant too (no discard, no query): what their queries cost.
-enum Value : int { Off = 0, On = 1, Verify = 2, OnColourOff = 3, ProbeDiscards = 4 };
+/// 5 (TEST): as 3 (no colour variants), with the pre-pass for discarding draws (1 and 2 have it
+/// too), to measure what the pre-pass adds.
+enum Value : int {
+    Off = 0,
+    On = 1,
+    Verify = 2,
+    OnColourOff = 3,
+    ProbeDiscards = 4,
+    OnPrepassOnly = 5,
+};
 
 [[nodiscard]] inline int RawMode() noexcept {
     return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_occl_flag,
@@ -41,8 +50,16 @@ enum Value : int { Off = 0, On = 1, Verify = 2, OnColourOff = 3, ProbeDiscards =
 [[nodiscard]] inline int Mode() noexcept {
     const int value = RawMode();
     return value == Verify                                                     ? Verify
-           : (value == On || value == OnColourOff || value == ProbeDiscards) ? On
-                                                                               : Off;
+           : (value == On || value == OnColourOff || value == ProbeDiscards ||
+              value == OnPrepassOnly)
+               ? On
+               : Off;
+}
+
+/// Counted colour-off draws whose program discards may take the flag pre-pass (1, 2, 5).
+[[nodiscard]] inline bool PrepassAllowed() noexcept {
+    const int value = RawMode();
+    return value == On || value == Verify || value == OnPrepassOnly;
 }
 
 /// Colour-writing counted draws may take the colour flag variant (not with =3).
@@ -113,6 +130,13 @@ struct Stats {
     std::atomic<u64> made{};           ///< flag pipelines made
     std::atomic<u64> colour_made{};    ///< colour flag pipelines made (guest pixel program)
     std::atomic<u64> colour_flag_draws{}; ///< counted colour-writing draws with a flag pipeline
+    std::atomic<u64> prepass_draws{};  ///< counted discarding draws drawn with the pre-pass
+    std::atomic<u64> prepass_made{};   ///< pre-pass pipelines made
+    std::atomic<u64> prepass_fallback{}; ///< pre-pass refused at the draw (indirect, delta, dump)
+    std::atomic<u64> prepass_paused{}; ///< pre-passes drawn between two host queries
+    std::atomic<u64> prepass_lost{};   ///< real draws the parent could not configure (must be 0)
+    std::atomic<u64> prepass_skipped{}; ///< mode 1, a host query already open: real draw only
+    std::atomic<u64> prepass_refused{}; ///< pre-pass variants whose descriptors differ
     std::atomic<u64> failed{};         ///< flag pipelines that failed to translate
     std::atomic<u64> no_slot{};        ///< flag draws with no open query (stored to the sink)
     std::atomic<u64> compared{};       ///< reports whose counted draws were all flag draws
@@ -158,7 +182,11 @@ inline void MaybeLog() {
                  q0_f1 = take(g.q0_f1), q1_f0 = take(g.q1_f0), mixed = take(g.mixed),
                  no_flag = take(g.no_flag), reused = take(g.reused),
                  flag_slots = take(g.flag_slots), query_slots = take(g.query_slots),
-                 colour_flag_draws = take(g.colour_flag_draws), colour_made = take(g.colour_made);
+                 colour_flag_draws = take(g.colour_flag_draws), colour_made = take(g.colour_made),
+                 prepass_draws = take(g.prepass_draws), prepass_made = take(g.prepass_made),
+                 prepass_fallback = take(g.prepass_fallback),
+                 prepass_paused = take(g.prepass_paused),
+                 prepass_skipped = take(g.prepass_skipped);
     LOG_INFO(Render_Vulkan,
              "Occlusion flags (FRITCHII_OCCL_FLAG={}) per second: counted draws {:.0f} with a "
              "flag pipeline, {:.0f} without (not Lean {:.0f}, regs refused {:.0f}, not ready "
@@ -166,10 +194,16 @@ inline void MaybeLog() {
              "{:.0f}; reports compared {:.0f}: agree {:.0f}, query 0 flag 1 {:.0f}, query 1 flag 0 "
              "{:.0f} (must be 0; {} since boot); mixed {:.0f}, no flag {:.0f}, bank reused {:.0f}; "
              "slots opened: {:.0f} flag (no host query), {:.0f} with a host query; colour flag "
-             "draws {:.0f}, colour flag pipelines made {:.0f}",
+             "draws {:.0f}, colour flag pipelines made {:.0f}; pre-pass draws {:.0f} ({:.0f} "
+             "between host queries, {:.0f} skipped: a host query open), made {:.0f}, refused at "
+             "the draw {:.0f}, refused for their descriptors {} since boot, real draws lost {} "
+             "(must be 0)",
              Mode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
-             mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made);
+             mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made,
+             prepass_draws, prepass_paused, prepass_skipped, prepass_made, prepass_fallback,
+             g.prepass_refused.load(std::memory_order_relaxed),
+             g.prepass_lost.load(std::memory_order_relaxed));
     std::string census;
     for (size_t i = 0; i < static_cast<size_t>(Census::Count); ++i) {
         census += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", CensusNames[i], take(g.census[i]));

@@ -500,6 +500,25 @@ public:
     /// occl_flag_colour_state: 0 not tried, 1 made, 2 refused for good.
     std::unique_ptr<GraphicsPipeline> occl_flag_colour;
     u8 occl_flag_colour_state{};
+    /// FRITCHII_OCCL_FLAG: the pre-pass variant, for counted colour-off draws whose program
+    /// discards (the guest pixel program with early fragment tests and the flag store at its
+    /// end, drawn first with depth writes off; the real draw follows with this pipeline).
+    std::unique_ptr<GraphicsPipeline> occl_flag_prepass;
+    u8 occl_flag_prepass_state{};
+    /// On a flag variant, its kind: 1 host flag program, 2 colour, 3 pre-pass.
+    static constexpr u8 OCCL_KIND_PREPASS = 3;
+    u8 occl_flag_kind{};
+    /// On a pre-pass variant: its last Configure's rescaling words and render area, which the
+    /// parent pushes again when it is bound for the real draw (ConfigureAfterOcclPrepass).
+    std::remove_cvref_t<decltype(std::declval<const RescalingPushConstant&>().Data())>
+        occl_prepass_rescaling{};
+    RenderAreaPushConstant occl_prepass_render_area{};
+
+    /// FRITCHII_OCCL_FLAG pre-pass: binds this pipeline (the parent) for the real draw that
+    /// follows `variant`'s pre-pass draw, with the descriptors `variant`'s Configure acquired for
+    /// this draw (the same stage infos: the same entries) and its push constants. False when the
+    /// draw cannot be configured (the real draw is not recorded then).
+    bool ConfigureAfterOcclPrepass(const GraphicsPipeline& variant);
 
     /// FRITCHII_OCCL_FLAG: the layout the flag slot address is pushed with.
     [[nodiscard]] VkPipelineLayout Layout() const noexcept {

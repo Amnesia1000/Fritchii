@@ -108,6 +108,10 @@ struct RuntimeInfo {
     /// (the open occlusion query's flag slot). Only for programs that cannot discard, write
     /// depth or the sample mask, store, or use subgroup operations (the caller checks).
     bool occl_flag_store{};
+    /// FRITCHII_OCCL_FLAG pre-pass (fragment, Vulkan): as occl_flag_store, but the store is at
+    /// the end of main (each exit, after the alpha test and every discard: a demoted invocation's
+    /// store is dropped), for a draw with depth and stencil writes off whose program discards.
+    bool occl_flag_store_at_end{};
 
     TessPrimitive tess_primitive{};
     TessSpacing tess_spacing{};

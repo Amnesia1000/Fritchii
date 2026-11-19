@@ -2398,7 +2398,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             !query_cache_runtime.OcclFlagReady()) {
             return chosen;
         }
-        return pipeline_cache.OcclFlagPipeline(chosen, maxwell3d->regs, allow_make);
+        GraphicsPipeline* const flag =
+            pipeline_cache.OcclFlagPipeline(chosen, maxwell3d->regs, allow_make);
+        // The pre-pass records the draw twice: not for indirect and list draws (recording them
+        // consumes their arguments), the delta path and draw counting (they key on the bound
+        // pipeline), or a frame dump's probe.
+        if (flag != nullptr && flag->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS &&
+            (is_indirect || draw_tracking || frame_dump.CapturingSampled())) [[unlikely]] {
+            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_fallback);
+            VideoCommon::OcclFlag::t_census = VideoCommon::OcclFlag::Census::OffDiscards;
+            return chosen;
+        }
+        return flag;
     };
     GraphicsPipeline* const pipeline{[&]() -> GraphicsPipeline* {
         if (delta_pipeline != nullptr) {
@@ -2927,6 +2938,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                      &address);
             });
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_draws);
+            if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS) {
+                VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_draws);
+            }
         } else if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
             query_cache_runtime.NoteOtherCountedDraw(
                 VideoCommon::OcclFlag::Blocks(census)); // nothing without the flag area
@@ -2946,7 +2960,54 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
             VideoCommon::MemStageShadow::BackDrawWindow(false);
         }
-        draw_func();
+        if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS) [[unlikely]] {
+            // FRITCHII_OCCL_FLAG pre-pass: the variant draws first with depth writes off and
+            // stores the flag; a host query open in this slot (verify, or a window that opened
+            // one) does not count it: it ends before and the window's next slot opens after.
+            // In mode 1 a host query already open counts the real draw exactly: no pre-pass.
+            namespace OcclFlag = VideoCommon::OcclFlag;
+            const bool query_open = query_cache_runtime.OcclQuerySlotOpen();
+            const bool prepass = !query_open || OcclFlag::Mode() == OcclFlag::Verify;
+            if (prepass) {
+                if (query_open) {
+                    query_cache_runtime.OcclPrepassPause();
+                    OcclFlag::Add(OcclFlag::g_stats.prepass_paused);
+                }
+                scheduler.Record(
+                    [](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthWriteEnableEXT(false); });
+                draw_func();
+                scheduler.Record([enable = maxwell3d->regs.depth_write_enabled != 0](
+                                     vk::CommandBuffer cmdbuf) {
+                    cmdbuf.SetDepthWriteEnableEXT(enable);
+                });
+                if (query_open) {
+                    query_cache_runtime.OcclPrepassResume();
+                }
+            } else {
+                OcclFlag::Add(OcclFlag::g_stats.prepass_skipped);
+            }
+            // The real draw: the parent bound again with this draw's descriptors. A submission
+            // inside (a descriptor allocation) ends the dynamic states and the open query: set
+            // them again.
+            GraphicsPipeline& parent = *pipeline->occl_flag_parent;
+            const u64 tick = scheduler.CurrentTick();
+            if (parent.ConfigureAfterOcclPrepass(*pipeline)) [[likely]] {
+                if (scheduler.CurrentTick() != tick) [[unlikely]] {
+                    UpdateDynamicStates(&parent);
+                    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                              maxwell3d->regs.zpass_pixel_count_enable);
+                }
+                trace_draw_hashes = {parent.ShaderHashes()[1], parent.ShaderHashes()[5]};
+                draw_func();
+            } else {
+                parent.occl_flag_prepass_state = 2; // later draws take the parent alone
+                OcclFlag::g_stats.prepass_lost.fetch_add(1, std::memory_order_relaxed);
+                LOG_ERROR(Render_Vulkan, "Occlusion flag pre-pass: the real draw could not be "
+                                         "configured and was not recorded");
+            }
+        } else {
+            draw_func();
+        }
     }
     if (probe) {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;

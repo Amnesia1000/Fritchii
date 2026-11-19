@@ -349,8 +349,14 @@ public:
 
     /// FRITCHII_OCCL_FLAG: this module stores the occlusion flag (fragment, Vulkan).
     [[nodiscard]] bool UsesOcclFlagStore() const {
-        return stage == Stage::Fragment && runtime_info.occl_flag_store &&
+        return stage == Stage::Fragment &&
+               (runtime_info.occl_flag_store || runtime_info.occl_flag_store_at_end) &&
                profile.unified_descriptor_binding;
+    }
+
+    /// FRITCHII_OCCL_FLAG pre-pass: the store is at the end of main, not at its start.
+    [[nodiscard]] bool OcclFlagStoreAtEnd() const {
+        return UsesOcclFlagStore() && runtime_info.occl_flag_store_at_end;
     }
 
     Id local_memory{};

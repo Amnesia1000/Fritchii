@@ -659,7 +659,7 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                  u128* spirv_hash = nullptr) {
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
-    if (runtime_info.occl_flag_store) [[unlikely]] {
+    if (runtime_info.occl_flag_store || runtime_info.occl_flag_store_at_end) [[unlikely]] {
         // FRITCHII_OCCL_FLAG_DUMP=<folder>: the first 64 colour flag pixel programs as .spv
         // files (for spirv-val).
         static std::atomic<int> dumped{};
@@ -3698,6 +3698,7 @@ GraphicsPipeline* PipelineCache::OcclLeanPipeline(GraphicsPipeline* full, const 
 thread_local u8 t_occl_flag_build{};
 constexpr u8 OCCL_FLAG_BUILD_HOST = 1;   ///< the host flag pixel program (colour off)
 constexpr u8 OCCL_FLAG_BUILD_COLOUR = 2; ///< the guest pixel program with the flag store
+constexpr u8 OCCL_FLAG_BUILD_PREPASS = 3; ///< the guest pixel program, the store at its end
 
 /// FRITCHII_OCCL_FLAG: why `pipeline`'s guest pixel program (Lean class: no discard, depth or
 /// sample mask writes, stores) cannot take the flag store with early fragment tests for a
@@ -3708,6 +3709,24 @@ constexpr u8 OCCL_FLAG_BUILD_COLOUR = 2; ///< the guest pixel program with the f
 /// sample mask writes, stores, subgroup/quad/helper operations, alpha to coverage), drawn with
 /// no depth or stencil writes: early fragment tests and a flag store after the discards would
 /// count exactly what the query counts.
+bool OcclFlagStageWrites(const Shader::Info& info) {
+    const bool writes_storage = std::ranges::any_of(
+        info.storage_buffers_descriptors, [](const auto& desc) { return desc.is_written; });
+    const bool writes_images =
+        std::ranges::any_of(info.image_descriptors,
+                            [](const auto& desc) { return desc.is_written; }) ||
+        std::ranges::any_of(info.image_buffer_descriptors,
+                            [](const auto& desc) { return desc.is_written; });
+    return writes_storage || writes_images || info.stores_global_memory ||
+           info.uses_typeless_image_writes || info.uses_global_increment ||
+           info.uses_global_decrement || info.uses_shared_increment ||
+           info.uses_shared_decrement || info.uses_atomic_f32_add || info.uses_atomic_f16x2_add ||
+           info.uses_atomic_f16x2_min || info.uses_atomic_f16x2_max ||
+           info.uses_atomic_f32x2_add || info.uses_atomic_f32x2_min ||
+           info.uses_atomic_f32x2_max || info.uses_atomic_s32_min || info.uses_atomic_s32_max ||
+           info.uses_int64_bit_atomics || info.uses_atomic_image_u32;
+}
+
 bool OcclFlagDiscardsNoWrites(const GraphicsPipeline& pipeline,
                               const Tegra::Engines::Maxwell3D::Regs& regs) {
     const auto& infos = pipeline.StageInfos();
@@ -3738,6 +3757,78 @@ bool OcclFlagDiscardsNoWrites(const GraphicsPipeline& pipeline,
         (regs.stencil_front_mask != 0 ||
          (regs.stencil_two_side_enable != 0 && regs.stencil_back_mask != 0));
     return regs.depth_write_enabled == 0 && !stencil_writes;
+}
+
+/// FRITCHII_OCCL_FLAG pre-pass: a counted colour-off draw whose pixel program discards (and is
+/// otherwise Lean, without subgroup, quad or helper operations, alpha to coverage) can be drawn
+/// twice: first with depth writes off, early fragment tests and the flag store after the
+/// discards, then as it is with no host query. The pre-pass tests the depth before the draw;
+/// the draw's own writes only make later fragments fail where an earlier one of it passed (and
+/// was not discarded) with a monotonic compare, so "some sample passed" is the same. Not with
+/// stencil writes (stencil tests depend on them), depth bounds (they test the written depth),
+/// transform feedback or stores in any stage (they would run twice), NOTEQUAL with depth writes,
+/// or a pipeline without dynamic depth writes (the pre-pass turns them off).
+bool OcclFlagPrepassEligible(const GraphicsPipeline& pipeline,
+                             const Tegra::Engines::Maxwell3D::Regs& regs) {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    // Mandated early Z: the draw counts samples before its discards, the pre-pass after them.
+    if (!pipeline.UsesExtendedDynamicState() || pipeline.IsMeshPipeline() ||
+        pipeline.Key().state.xfb_enabled != 0 ||
+        pipeline.Key().state.alpha_to_coverage_enabled != 0 ||
+        pipeline.Key().state.early_z != 0) {
+        return false;
+    }
+    const auto& infos = pipeline.StageInfos();
+    const Shader::Info& pixel = infos[infos.size() - 1];
+    if (pixel.stores_frag_depth || pixel.stores_sample_mask || pixel.uses_subgroup_vote ||
+        pixel.uses_subgroup_mask || pixel.uses_subgroup_shuffles ||
+        pixel.uses_subgroup_invocation_id || pixel.uses_is_helper_invocation ||
+        pixel.uses_quad_shuffles || pixel.uses_fswzadd) {
+        return false;
+    }
+    if (std::ranges::any_of(infos, [](const Shader::Info& info) {
+            return OcclFlagStageWrites(info);
+        })) {
+        return false;
+    }
+    const bool stencil_writes =
+        regs.stencil_enable != 0 &&
+        (regs.stencil_front_mask != 0 ||
+         (regs.stencil_two_side_enable != 0 && regs.stencil_back_mask != 0));
+    const bool not_equal = regs.depth_test_func == Regs::ComparisonOp::NotEqual_D3D ||
+                           regs.depth_test_func == Regs::ComparisonOp::NotEqual_GL;
+    // EQUAL: the pre-pass's positions come from a separate (whole pipeline) compile of the
+    // vertex programs; a last-bit difference would decide an equal test.
+    const bool equal = regs.depth_test_func == Regs::ComparisonOp::Equal_D3D ||
+                       regs.depth_test_func == Regs::ComparisonOp::Equal_GL;
+    return regs.rasterize_enable != 0 && regs.transform_feedback_enabled == 0 &&
+           regs.depth_bounds_enable == 0 && !stencil_writes &&
+           !(regs.depth_test_enable != 0 && equal) &&
+           !(regs.depth_test_enable != 0 && regs.depth_write_enabled != 0 && not_equal);
+}
+
+/// FRITCHII_OCCL_FLAG pre-pass: the variant was translated again from the draw's environments
+/// (storage buffers found from the live constant buffers); the parent binds the descriptors the
+/// variant's Configure acquired, so both must describe the same descriptors, stage by stage.
+bool OcclFlagSameDescriptors(const GraphicsPipeline& a, const GraphicsPipeline& b) {
+    const auto& x = a.StageInfos();
+    const auto& y = b.StageInfos();
+    if (x.size() != y.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i].constant_buffer_descriptors != y[i].constant_buffer_descriptors ||
+            x[i].storage_buffers_descriptors != y[i].storage_buffers_descriptors ||
+            x[i].texture_buffer_descriptors != y[i].texture_buffer_descriptors ||
+            x[i].image_buffer_descriptors != y[i].image_buffer_descriptors ||
+            x[i].texture_descriptors != y[i].texture_descriptors ||
+            x[i].image_descriptors != y[i].image_descriptors ||
+            x[i].uses_rescaling_uniform != y[i].uses_rescaling_uniform ||
+            x[i].uses_render_area != y[i].uses_render_area) {
+            return false;
+        }
+    }
+    return true;
 }
 
 VideoCommon::OcclFlag::Census OcclFlagColourVerdict(const GraphicsPipeline& pipeline) {
@@ -3799,7 +3890,7 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
             OcclFlag::ColourAllowed() && device.IsShaderInt64Supported()) {
             GraphicsPipeline* colour = pipeline->occl_flag_colour.get();
             if (colour == nullptr && allow_make) {
-                colour = FindOrMakeOcclFlag(*pipeline, true);
+                colour = FindOrMakeOcclFlag(*pipeline, OCCL_FLAG_BUILD_COLOUR);
             }
             if (colour != nullptr && colour->Failed()) [[unlikely]] {
                 pipeline->occl_flag_colour_state = 2;
@@ -3854,6 +3945,29 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
         }
         OcclFlag::Add(stats.refused_regs);
         return pipeline;
+    }
+    if (pipeline_class == PipelineClass::Discards && OcclFlag::PrepassAllowed() &&
+        pipeline->occl_flag_prepass_state != 2 && pipeline->IsBuilt() &&
+        device.IsShaderInt64Supported() && OcclFlagPrepassEligible(*pipeline, regs)) {
+        GraphicsPipeline* prepass = pipeline->occl_flag_prepass.get();
+        if (prepass == nullptr && allow_make) {
+            prepass = FindOrMakeOcclFlag(*pipeline, OCCL_FLAG_BUILD_PREPASS);
+        }
+        if (prepass != nullptr && prepass->Failed()) [[unlikely]] {
+            pipeline->occl_flag_prepass_state = 2;
+            OcclFlag::Add(stats.failed);
+            prepass = nullptr;
+        }
+        if (prepass != nullptr && prepass->IsBuilt()) {
+            OcclFlag::t_census = Census::Flag;
+            prepass->MarkUsed(frame_count);
+            return prepass;
+        }
+        if (pipeline->occl_flag_prepass_state != 2) {
+            OcclFlag::t_census = Census::NotReady;
+            OcclFlag::Add(stats.not_ready);
+            return pipeline;
+        }
     }
     const bool probe_discards = OcclFlag::RawMode() == OcclFlag::ProbeDiscards &&
                                 pipeline_class == PipelineClass::Discards;
@@ -3914,7 +4028,7 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
     return flag;
 }
 
-GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, bool colour) {
+GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 kind) {
     namespace OcclFlag = VideoCommon::OcclFlag;
     // The environments come from the registers of this draw: only while the current key names
     // full's programs. One translation a frame, shared with the lean siblings.
@@ -3926,7 +4040,7 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, bool
     std::unique_ptr<GraphicsPipeline> made;
     {
         graphics_key = full.Key();
-        t_occl_flag_build = colour ? OCCL_FLAG_BUILD_COLOUR : OCCL_FLAG_BUILD_HOST;
+        t_occl_flag_build = kind;
         SCOPE_EXIT {
             graphics_key = saved;
             t_occl_flag_build = 0;
@@ -3939,18 +4053,37 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, bool
             made.reset();
         }
     }
+    u8& state = kind == OCCL_FLAG_BUILD_COLOUR    ? full.occl_flag_colour_state
+                : kind == OCCL_FLAG_BUILD_PREPASS ? full.occl_flag_prepass_state
+                                                  : full.occl_flag_state;
     if (!made) {
         OcclFlag::Add(OcclFlag::g_stats.failed);
-        (colour ? full.occl_flag_colour_state : full.occl_flag_state) = 2;
+        state = 2;
         return nullptr;
     }
-    OcclFlag::Add(colour ? OcclFlag::g_stats.colour_made : OcclFlag::g_stats.made);
     made->occl_flag_parent = &full;
-    if (colour) {
+    made->occl_flag_kind = kind;
+    state = 1;
+    if (kind == OCCL_FLAG_BUILD_COLOUR) {
+        OcclFlag::Add(OcclFlag::g_stats.colour_made);
         full.occl_flag_colour = std::move(made);
-        full.occl_flag_colour_state = 1;
         return full.occl_flag_colour.get();
     }
+    if (kind == OCCL_FLAG_BUILD_PREPASS) {
+        if (!OcclFlagSameDescriptors(*made, full)) {
+            state = 2; // the parent could not bind this variant's descriptors
+            OcclFlag::Add(OcclFlag::g_stats.prepass_refused);
+            LOG_INFO(Render_Vulkan,
+                     "Occlusion flag pre-pass: {}: its translation's descriptors differ from "
+                     "the pipeline's; no pre-pass for it",
+                     OcclShaders(full.Key()));
+            return nullptr;
+        }
+        OcclFlag::Add(OcclFlag::g_stats.prepass_made);
+        full.occl_flag_prepass = std::move(made);
+        return full.occl_flag_prepass.get();
+    }
+    OcclFlag::Add(OcclFlag::g_stats.made);
     full.occl_flag = std::move(made);
     full.occl_flag_state = 1;
     return full.occl_flag.get();
@@ -9213,6 +9346,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (t_occl_flag_build == OCCL_FLAG_BUILD_COLOUR &&
             program.stage == Shader::Stage::Fragment) {
             runtime_info.occl_flag_store = true; // FRITCHII_OCCL_FLAG: the colour flag variant
+        }
+        if (t_occl_flag_build == OCCL_FLAG_BUILD_PREPASS &&
+            program.stage == Shader::Stage::Fragment) {
+            runtime_info.occl_flag_store_at_end = true; // FRITCHII_OCCL_FLAG: the pre-pass
         }
         if (mesh_emulation && (program.stage == Shader::Stage::Mesh ||
                                program.stage == Shader::Stage::Task)) {
