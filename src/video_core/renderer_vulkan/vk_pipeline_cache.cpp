@@ -914,6 +914,19 @@ bool AppCacheBesideDriver(const Device& device) {
     return AmdAppCache(device) || IntelDriverCache(device);
 }
 
+/// FRITCHII_INTEL_PCACHE_FETCH (boot, default 1; 0 = as on other drivers): Intel's Windows driver
+/// can fault in vkGetPipelineCacheData while other threads build with that cache, closing the game
+/// without a message. Pipeline builds cannot be paused from here, so on that driver the data is
+/// only fetched once none run: at exit and between titles. Its own disk cache keeps what a crash
+/// would lose from our file.
+bool IntelFetchesCacheWhenIdle(const Device& device) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FRITCHII_INTEL_PCACHE_FETCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && IntelDriverCache(device);
+}
+
 /// FRITCHII_PCACHE_SAVE (boot, default 1; 0 = every save as before): our VkPipelineCache file is
 /// written only when the driver's data changed size since it was read or written, and in play
 /// only with room in RAM for it.
@@ -4196,6 +4209,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         background_slots.store(0, std::memory_order_relaxed);
         serialization_thread.WaitForRequests();
         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+            if (IntelFetchesCacheWhenIdle(device)) {
+                workers.WaitForRequests();
+            }
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                          CACHE_VERSION);
         }
@@ -7481,7 +7497,8 @@ bool PipelineCache::VulkanPipelineCacheSaveDue(std::chrono::steady_clock::time_p
 }
 
 void PipelineCache::QueueVulkanPipelineCacheSave(bool again_if_busy) {
-    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty() ||
+        IntelFetchesCacheWhenIdle(device)) {
         return;
     }
     if (flush_in_flight.exchange(true, std::memory_order_acq_rel)) {
@@ -7924,7 +7941,7 @@ PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
     // The VkPipelineCache object keeps every binary built this session in memory. Its size comes
     // from the saves, and between them from a query once a minute on the serialization thread
     // (some drivers serialize the whole cache to answer it), never while a save is under way.
-    if (use_vulkan_pipeline_cache && vulkan_pipeline_cache) {
+    if (use_vulkan_pipeline_cache && vulkan_pipeline_cache && !IntelFetchesCacheWhenIdle(device)) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_cache_size_query >= std::chrono::minutes{1} &&
             !flush_in_flight.load(std::memory_order_acquire)) {

@@ -6150,6 +6150,16 @@ different patches only the blend part of the key. Reads the registers, so the po
 without the flag are still caught. Logs "saved by the blend value check" and why the other
 lookups refreshed in "EDEN_NX2_PIPELINE_CLEAN per second". Off by default, not measured yet.
 
+### FRITCHII_INTEL_PCACHE_FETCH
+
+Boot, default 1 on Intel's Windows driver (no effect elsewhere); 0 = saves during play as on other
+drivers. That driver can fault inside vkGetPipelineCacheData while other threads build pipelines
+with the same cache, and the game closes with no message. Our VkPipelineCache file is then only
+read back from the driver with no build running: at exit and between titles. A crash loses what
+this session added to our file only; Intel's own disk cache still has it. No effect on speed or
+picture. Check on an Intel GPU: play 10 minutes with new pipelines, no "Vulkan driver pipelines
+cached at" in play, one at exit, and the next boot logs "Loaded Vulkan driver pipeline cache".
+
 ### FRITCHII_PCACHE_SAVE
 
 Boot, default 1; 0 = every save as before. Only where our VkPipelineCache file is in use (not
