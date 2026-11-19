@@ -769,6 +769,8 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Hook{0x2C2208C, 0xBD466D02, 0x14409231}, // -> b 0x3c46950
         Hook{0x3CDFC0, 0x1E380008, 0x14E1E27C}, // time of day cut -> b 0x3c469b0
         Hook{0x632D00, 0x1E380016, 0x14D84F31}, // Deku Tree web cut -> b 0x3c469c4
+        Hook{0x38AEBF4, 0x1E380001, 0x940E5FAE}, // solver steps -> bl 0x3c46aac
+        Hook{0x38AFD20, 0x1E380001, 0x940E5B63}, // solver steps -> bl 0x3c46aac
     };
     // Each stub's first and last word.
     struct Stub {
@@ -797,6 +799,8 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Stub{0x3C46950, 0x5C, 0xA9BF47F0, 0x17BF6DBA}, // cloth d ... b 0x2c22090
         Stub{0x3C469B0, 0x14, 0x9100F26D, 0x171E1D81}, // time of day: add x13 ... b 0x3cdfc4
         Stub{0x3C469C4, 0x14, 0x9123E26D, 0x1727B0CC}, // Deku Tree web: add x13 ... b 0x632d04
+        Stub{0x3C469D8, 0x8, 0x3A83126F, 0x3DCCCCCD},  // the solver's constants
+        Stub{0x3C46AAC, 0x50, 0x1E380001, 0xD65F03C0}, // solver: fcvtzs w1, s0 ... ret
         Stub{0x3C46E8C, 0x84, 0x1E38000C, 0xD65F03C0}, // whole units: fcvtzs w12, s0 ... ret
     };
     // The hooks a test switch can leave out, one at a time.

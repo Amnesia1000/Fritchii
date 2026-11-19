@@ -828,6 +828,31 @@ constexpr std::array<u8, 20> HR_WEB_STUB{
     0xF6, 0x03, 0x0C, 0x2A, 0xCC, 0xB0, 0x27, 0x17,
 };
 
+// The physics solver's steps: each update the game sets them to trunc(step * the steps of a 60 fps
+// frame + 0.001), stored to the solver's +0x2C8 (main+0x38AEB80 and main+0x38AFC10, the same code
+// in both). Below a step of 1 the count is cut short and changes from frame to frame as the
+// measured step wanders (8 x 0.49 gives 3, 8 x 0.5 gives 4), and it reaches 0 at high enough
+// rates, so moving platforms slide out from under the player. High refresh mode, step under 1:
+// the count is ceil(scaled - 0.1), at least 1, so a solver step never covers more time than at
+// 60 fps (give or take the 0.1 for jitter, which keeps a steady rate at a steady count). That is
+// never below the game's count. A step of 1 or more keeps the game's count, as does Dark's mode.
+// Both sites call it (bl over fcvtzs w1, s0): a blr follows at once, so x16, x17, s16, s17 and
+// x30 are free there. In: s0 = the game's float, s1 = the steps of a 60 fps frame. Out: w1.
+//   w1 = fcvtzs(s0) ; call word is not ours: ret ; s16 = s0 - 0.001 ; s16 <= 0 or s16 >= s1: ret ;
+//   w1 = max(fcvtzs(ceil(s16 - 0.1)), 1) ; ret
+constexpr std::array<u8, 8> HR_SOLVER_CONSTANTS{
+    0x6F, 0x12, 0x83, 0x3A, 0xCD, 0xCC, 0xCC, 0x3D, // 0.001f (the game's own), 0.1f
+};
+constexpr std::array<u8, 80> HR_SOLVER{
+    0x01, 0x00, 0x38, 0x1E, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
+    0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
+    0xA1, 0x01, 0x00, 0x54, 0x90, 0xF8, 0xFF, 0x1C, 0x10, 0x38, 0x30, 0x1E,
+    0x08, 0x22, 0x20, 0x1E, 0x2D, 0x01, 0x00, 0x54, 0x00, 0x22, 0x21, 0x1E,
+    0xEA, 0x00, 0x00, 0x54, 0xF1, 0xF7, 0xFF, 0x1C, 0x10, 0x3A, 0x31, 0x1E,
+    0x10, 0xC2, 0x24, 0x1E, 0x10, 0x02, 0x38, 0x1E, 0x1F, 0x06, 0x00, 0x71,
+    0x01, 0xC6, 0x9F, 0x1A, 0xC0, 0x03, 0x5F, 0xD6,
+};
+
 // The hooks (each checked to hold the game's word), then the stubs in address order.
 constexpr std::array HR_FIX_HOOKS{
     OotFixHook{0x415300, {0x28, 0xC4, 0xE0, 0x14}, 0xD503237F}, // pacibsp -> b 0x3c463a0
@@ -867,6 +892,10 @@ constexpr std::array HR_FIX_HOOKS{
                "FRITCHII_NO_HR_TIME"},
     OotFixHook{0x632D00, {0x31, 0x4F, 0xD8, 0x14}, 0x1E380016, // fcvtzs w22, s0 -> b 0x3c469c4
                "FRITCHII_NO_HR_WEB"},
+    OotFixHook{0x38AEBF4, {0xAE, 0x5F, 0x0E, 0x94}, 0x1E380001, // fcvtzs w1, s0 -> bl 0x3c46aac
+               "FRITCHII_NO_HR_SOLVER"},
+    OotFixHook{0x38AFD20, {0x63, 0x5B, 0x0E, 0x94}, 0x1E380001, // fcvtzs w1, s0 -> bl 0x3c46aac
+               "FRITCHII_NO_HR_SOLVER"},
 };
 constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C463A0, SOUND_GATE},
@@ -888,6 +917,8 @@ constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C46950, CLOTH_DT_D},
     OotFixStub{0x3C469B0, HR_TIME_STUB},
     OotFixStub{0x3C469C4, HR_WEB_STUB},
+    OotFixStub{0x3C469D8, HR_SOLVER_CONSTANTS},
+    OotFixStub{0x3C46AAC, HR_SOLVER},
 };
 // Stubs past the pickup stub, also in address order.
 constexpr std::array HR_FIX_LATE_STUBS{
