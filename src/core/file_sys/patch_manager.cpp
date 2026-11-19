@@ -1028,7 +1028,8 @@ constexpr std::array BUILTIN_PATCHES{
         .disable_env = "FRITCHII_NO_SHADOW_STEPS",
     },
     // OoT's render height (oot_render_height, Settings::OcarinaRenderHeight) under Max
-    // Resolution with DLSS or FSR (listed in Add-Ons only while it applies).
+    // Resolution with DLSS or FSR. The picture menu owns it: not in Add-Ons, where unticking one
+    // would leave the menu naming a height the game doesn't draw.
     BuiltinPatch{
         .name = "360p render (built-in)",
         .title_id = 0x0400486024DEC000,
@@ -1803,7 +1804,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             LOG_INFO(Loader, "    - Skipping \"{}\": {}=1", patch.name, patch.disable_env);
             continue;
         }
-        if (ab != "0" &&
+        // A render height unticked in an earlier build counts for nothing: the row is gone.
+        if (ab != "0" && patch.render_height == 0 &&
             std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
             continue;
@@ -2405,7 +2407,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id ||
+        if (patch.title_id != title_id || patch.render_height != 0 ||
             (patch.enable_env != nullptr &&
              std::string_view{std::getenv(patch.enable_env) ? std::getenv(patch.enable_env) : ""} !=
                  "1") ||
