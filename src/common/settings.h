@@ -1063,6 +1063,9 @@ inline constexpr std::array<u32, 8> OcarinaRenderHeights{360, 540, 720, 810, 900
 /// oot_render_height setting below 1440 with DLSS or FSR picked for OoT, docked, Max Resolution
 /// on; while the setting is 0, FRITCHII_DLSS_RENDER_SCALE's Performance / Ultra Performance.
 [[nodiscard]] std::optional<u32> OcarinaRenderHeight();
+/// The frontend, before a game boots: whether the card it will run on can run DLSS (the patch is
+/// applied before the renderer exists). Default true, for frontends that don't know.
+void SetOcarinaCardRunsDlss(bool runs);
 /// The render height whose patch the running game's main module got (none: unpatched).
 void SetAppliedOcarinaRenderHeight(std::optional<u32> height);
 [[nodiscard]] std::optional<u32> AppliedOcarinaRenderHeight();

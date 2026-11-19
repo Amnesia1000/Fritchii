@@ -2412,6 +2412,16 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         QtCommon::system->ApplySettings();
     }
 
+    // OoT's render height patch is decided while the game loads, before the renderer exists: a DLSS
+    // "on" saved for another card must not lower it (per-game settings are in by now).
+    if (!vk_device_records.empty()) {
+        const size_t card = VkDeviceInfo::PickedIndex(vk_device_records,
+                                                      Settings::values.vulkan_device.GetValue(),
+                                                      Settings::values.vulkan_device_name.GetValue());
+        Settings::SetOcarinaCardRunsDlss(card < vk_device_records.size() &&
+                                         VkDeviceInfo::RunsDlss(vk_device_records[card]));
+    }
+
     if (title_id == Settings::MarioKartWorldProgramId && !asked_recommended_mkw_settings) {
         asked_recommended_mkw_settings = true;
         use_recommended_mkw_settings =

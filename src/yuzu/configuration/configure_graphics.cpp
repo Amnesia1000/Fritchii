@@ -835,16 +835,6 @@ QString HeightName(u32 height) {
     return QStringLiteral("%1p").arg(height);
 }
 
-/// Whether the card can run DLSS: NVIDIA, and not a GeForce or Quadro from before RTX (GTX, MX,
-/// GT, Quadro P: Streamline refuses them). Names it doesn't know stay allowed.
-bool CardRunsDlss(const VkDeviceInfo::Record& record) {
-    const std::string& name = record.device_name;
-    const bool pre_rtx = (name.find("GeForce") != std::string::npos ||
-                          name.find("Quadro") != std::string::npos) &&
-                         name.find("RTX") == std::string::npos;
-    return record.nvidia && !pre_rtx;
-}
-
 /// A resolution scale as a number to compare (never 0).
 u32 ScaleKey(Settings::ResolutionSetup setup) {
     Settings::ResolutionScalingInfo info{};
@@ -1027,7 +1017,7 @@ void ConfigureGraphics::UpdateUpscalerChoice() {
     constexpr bool fsr4_capable = false;
 #endif
     // Not offered on NVIDIA cards from before RTX either: most low-end GeForce cards can't run it.
-    const bool dlss_card = vulkan && CardRunsDlss(records[device]);
+    const bool dlss_card = vulkan && VkDeviceInfo::RunsDlss(records[device]);
     if (auto* view = qobject_cast<QListView*>(upscaler_combobox->view())) {
         const int fsr4_row = upscaler_combobox->findData(static_cast<u32>(Aa::Fsr4));
         if (fsr4_row >= 0) {
@@ -1203,7 +1193,7 @@ bool ConfigureGraphics::OcarinaUpscalerPicked() const {
     }
     // A saved DLSS on a card from before RTX never runs: the game's own upscale stays.
     const VkDeviceInfo::Record* const record = PictureRecord();
-    return DlssOn() && (record == nullptr || CardRunsDlss(*record));
+    return DlssOn() && (record == nullptr || VkDeviceInfo::RunsDlss(*record));
 }
 
 const VkDeviceInfo::Record* ConfigureGraphics::PictureRecord() const {
@@ -1554,7 +1544,7 @@ void ConfigureGraphics::UpdatePictureNote() {
     QString hint;
     if (picture_menu && upscaler != PictureUpscaler::None) {
         const VkDeviceInfo::Record* const record = PictureRecord();
-        if (upscaler == PictureUpscaler::Dlss && record != nullptr && !CardRunsDlss(*record)) {
+        if (upscaler == PictureUpscaler::Dlss && record != nullptr && !VkDeviceInfo::RunsDlss(*record)) {
             // A saved choice from another card: the list no longer offers it here.
             lines << tr("This card can't run DLSS. Pick FSR 3.1.");
         } else {

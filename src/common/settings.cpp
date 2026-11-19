@@ -110,6 +110,11 @@ NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
 
 namespace {
 std::atomic<u32> applied_ocarina_render_scale{};
+std::atomic<bool> ocarina_card_runs_dlss{true};
+}
+
+void SetOcarinaCardRunsDlss(bool runs) {
+    ocarina_card_runs_dlss.store(runs, std::memory_order_relaxed);
 }
 
 bool OcarinaDlssRenderScaleSwitch() {
@@ -151,8 +156,10 @@ std::optional<u32> OcarinaRenderHeight() {
     }
     const auto aa = values.oot_anti_aliasing.GetValue();
     const bool fsr = aa == OotAntiAliasing::Fsr3 || aa == OotAntiAliasing::Fsr4;
-    if (!fsr && !values.nvidia_dlss.GetValue()) {
-        // The game's own upscale: it draws its full 1440p.
+    if (!fsr && (!values.nvidia_dlss.GetValue() ||
+                 !ocarina_card_runs_dlss.load(std::memory_order_relaxed))) {
+        // The game's own upscale: it draws its full 1440p. A DLSS "on" saved for another card
+        // counts as off, as in the picture menu.
         return std::nullopt;
     }
     // The picture menu's "Resolution" (oot_render_height): 1440 is the game's own size.
