@@ -6034,6 +6034,13 @@ thunderbolt) and --link, --link-load, --link-us, --hog, --hog-mode, --bar, --lin
 - FRITCHII_SIM_BAR_MIB=<MiB> (boot; 0 = none): room the stream buffers get in CPU-visible device
   memory. The first pool made (texture and query uploads) asks first. What doesn't fit goes to host
   memory. It models the stream buffers only, not the driver's own use of the window.
+- FRITCHII_LINK_STATS=2 also hashes every buffer upload in 256-byte chunks against that chunk's last
+  upload and adds to the line how much was the same bytes again. Dry and costly (a hash table and a
+  second read of guest memory), and an upper bound: the GPU may have changed its copy meanwhile.
+- FRITCHII_PCIE_LINK_LOG=1 (boot; FRITCHII_LINK_STATS does it too): "PCIe link to the GPU: narrowest
+  reported ...", from Windows' PCI link properties of the GPU and of each PCI device above it (top
+  speed times the width in use). Read-only. A root port may report nothing (it does on the owner's
+  PC). A Thunderbolt or USB4 port, found by its name, is capped at 2750 MB/s. Nothing acts on it yet.
 - With FRITCHII_LINK_STATS each pool also logs, every 10 s, "Stream use for ...": MB/s and requests
   written, the worst frame, wraps, the most regions busy at a frame end, how often it was full and
   what went to host staging for it, how many of those were free at a fresh look at the GPU's

@@ -80,6 +80,7 @@
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/link_stats.h"
+#include "video_core/renderer_vulkan/vk_pcie_link.h"
 #include "video_core/renderer_vulkan/vk_sim_link_hog.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -644,6 +645,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     }
     // FRITCHII_STAGING_RING: the texture cache's pool (texture uploads at area loads).
     staging_pool.CreateUploadRing();
+    if (!device.IsIntegrated()) {
+        LogPcieLink(device.GetVendorID(), device.GetDeviceID());
+    }
     // FRITCHII_SIM_LINK_HOG: a copy load on the transfer queue (test).
     if (device.HasLinkHogQueue()) {
         sim_link_hog = std::make_unique<SimLinkHog>(device, memory_allocator);

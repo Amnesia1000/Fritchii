@@ -6,10 +6,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include <fmt/format.h>
 
+#include "common/cityhash.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/lowend_sim.h"
@@ -102,6 +105,48 @@ inline void NoteListDraw(bool in_host_memory) {
     }
 }
 
+/// FRITCHII_LINK_STATS=2: buffer uploads hashed in 256-byte chunks against the last upload of each
+/// chunk. A dry count, costly, for the question "how much of what we upload is the same bytes
+/// again". An upper bound on what a chunk skip could save: the GPU may have changed its copy.
+[[nodiscard]] inline bool ChunkCensusOn() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_link_stats,
+                                            "FRITCHII_LINK_STATS") >= 2;
+}
+
+struct ChunkCensus {
+    static constexpr u64 ChunkBytes = 256;
+    static constexpr size_t MaxChunks = size_t{1} << 21; // 512 MiB of guest memory
+    std::mutex mutex;
+    std::unordered_map<u64, u64> hashes;
+    std::atomic<u64> bytes{};
+    std::atomic<u64> same_bytes{};
+};
+inline ChunkCensus g_chunks;
+
+/// `data` must be ordinary cached memory: never a staging mapping.
+inline void NoteUploadChunks(u64 address, const u8* data, u64 size) {
+    ChunkCensus& census = g_chunks;
+    census.bytes.fetch_add(size, std::memory_order_relaxed);
+    const u64 first = (address + ChunkCensus::ChunkBytes - 1) / ChunkCensus::ChunkBytes;
+    const u64 last = (address + size) / ChunkCensus::ChunkBytes;
+    u64 same = 0;
+    std::scoped_lock lock{census.mutex};
+    if (census.hashes.size() > ChunkCensus::MaxChunks) {
+        census.hashes.clear();
+    }
+    for (u64 chunk = first; chunk < last; ++chunk) {
+        const u8* const bytes = data + (chunk * ChunkCensus::ChunkBytes - address);
+        const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes),
+                                            ChunkCensus::ChunkBytes);
+        const auto [it, inserted] = census.hashes.try_emplace(chunk, hash);
+        if (!inserted) {
+            same += it->second == hash ? ChunkCensus::ChunkBytes : 0;
+            it->second = hash;
+        }
+    }
+    census.same_bytes.fetch_add(same, std::memory_order_relaxed);
+}
+
 namespace Detail {
 struct Window {
     std::chrono::steady_clock::time_point start{};
@@ -158,6 +203,8 @@ inline void MaybeLog() {
         g_counters.list_draws.store(0, std::memory_order_relaxed);
         g_counters.list_draws_host.store(0, std::memory_order_relaxed);
         g_counters.stream_full.store(0, std::memory_order_relaxed);
+        g_chunks.bytes.store(0, std::memory_order_relaxed);
+        g_chunks.same_bytes.store(0, std::memory_order_relaxed);
         window.start = now;
         window.sim_cpu_ns = Common::LowEndSim::LinkCpuNsTotal();
         window.sim_gpu_ns = Common::LowEndSim::LinkGpuNsTotal();
@@ -188,12 +235,18 @@ inline void MaybeLog() {
                            static_cast<double>(gpu_reads.bytes + gpu_writes.bytes) * to_ms);
     };
     std::string sim;
+    if (const double chunk_bytes = per_second(g_chunks.bytes); chunk_bytes > 0.0) {
+        const double same = per_second(g_chunks.same_bytes);
+        sim = fmt::format("; buffer uploads {:.1f} MB/s, {:.1f} MB/s in 256-byte chunks equal to "
+                          "their last upload ({:.0f}%, at most what a chunk skip could save)",
+                          chunk_bytes / 1e6, same / 1e6, 100.0 * same / chunk_bytes);
+    }
     if (Common::LowEndSim::LinkOn()) {
         const u64 cpu_ns = Common::LowEndSim::LinkCpuNsTotal();
         const u64 gpu_ns = Common::LowEndSim::LinkGpuNsTotal();
-        sim = fmt::format("; simulated link {} MB/s ({} free): CPU threads spun {:.1f} ms/s, GPU "
-                          "owed {:.1f} ms/s",
-                          Common::LowEndSim::LinkMbps(), Common::LowEndSim::LinkFreeMbps(),
+        sim += fmt::format("; simulated link {} MB/s ({} free): CPU threads spun {:.1f} ms/s, GPU "
+                           "owed {:.1f} ms/s",
+                           Common::LowEndSim::LinkMbps(), Common::LowEndSim::LinkFreeMbps(),
                           static_cast<double>(cpu_ns - window.sim_cpu_ns) / 1e6 / seconds,
                           static_cast<double>(gpu_ns - window.sim_gpu_ns) / 1e6 / seconds);
         window.sim_cpu_ns = cpu_ns;
