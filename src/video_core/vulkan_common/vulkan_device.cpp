@@ -499,7 +499,8 @@ void GetHeapBudgets(const Device& device, std::array<VmaBudget, VK_MAX_MEMORY_HE
     case 0x163F: // Van Gogh (Steam Deck)
     case 0x1435: // Sephiroth (Steam Deck OLED)
     case 0x1681: // Rembrandt
-    case 0x164E: // Raphael and Granite Ridge graphics
+    case 0x164E: // Raphael graphics
+    case 0x13C0: // Granite Ridge graphics
     case 0x1506: // Mendocino
         return true;
     default:
