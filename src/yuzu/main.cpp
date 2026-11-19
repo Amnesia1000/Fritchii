@@ -251,6 +251,9 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     {"FRITCHII_DEPTH_POOL_BIG", "1"},     {"FRITCHII_RAM_GPU_ENTRIES", "1"},
     {"FRITCHII_SMALL_CARD", "2"},         {"FRITCHII_READ_SIDE_COPY", "3"},
     {"FRITCHII_GPU_SIBLINGS_FREE", "1"},  {"FRITCHII_PACE_FIX", "3"},
+    // Occlusion tests without host queries for OoT's colour-off test draws (the core; OoT only,
+    // not with precise counts, and only where one follower is off, as on AMD's Windows driver).
+    {"FRITCHII_OCCL_FLAG", "1"},
     // One follower (E/R GPU threads)
     {"FRITCHII_ONEF_LEAN", "1"},          {"FRITCHII_ONEF_AHEAD", "0"},
     {"FRITCHII_ONEF_POSTED", "1"},        {"FRITCHII_ONEF_COPY_E", "1"},

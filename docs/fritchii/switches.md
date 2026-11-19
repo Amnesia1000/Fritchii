@@ -2793,7 +2793,7 @@ compares (step 3 BuildPipeline would see the sibling); FRITCHII_ONEF_LEAN=1 turn
 
 ### FRITCHII_OCCL_FLAG (the "Occlusion flags" line)
 
-TEST, off by default (2026-11-18). Live between its values, but **set it at boot**: the device
+Built in at 1 since 6.2 (2026-11-19; the core, as its author asked; 0 turns it off). Live between its values, but **set it at boot**: the device
 keeps the buffer device address feature for the flag area only when FRITCHII_OCCL_FLAG is set
 when the device is made ("Occlusion flags (FRITCHII_OCCL_FLAG): buffer device address enabled
 for the flag area" at boot). Vulkan 1.2 or later; one follower off (the draw path it hooks is the
