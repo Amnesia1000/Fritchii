@@ -1068,6 +1068,18 @@ Boot, off by default (helper BJ, 2026-11-16). On AMD's proprietary Vulkan driver
 it on and ran clean with every FRITCHII_ONEF_* line out. Log once: "One follower: off on AMD's
 proprietary driver ...". 1 = keep it on there (tests). RADV, NVIDIA and Intel unchanged.
 
+### FRITCHII_ASTC_HELD_DEFER
+
+Boot, default 0 (helper BG's fix from 2026-11-16, ported by helper FJ). 1 = an ASTC GPU decode made
+while this thread holds a filled draw or dispatch packet (EXP123 >= 2) does not submit: the decode
+and its barrier stay in the current command buffer, ahead of the draw, and the next flush takes
+them. Why: that submit splits a held packet across two command buffers ("Memory seam (5.5) ...
+ASTCDecoderPass"), and both AMD cards lost the device 10-15 ms after one at the title. That loss
+is why EXP123 is held to 1 on AMD's driver (FRITCHII_SEAM_AMD), and with EXP123=1 the one follower
+posts nothing there ("lent: no ring", every draw a transient lend). Test on AMD with
+FRITCHII_SEAM_AMD=1: the 5.5 lines from ASTCDecoderPass must be gone, "ASTC GPU decode inside a
+held draw fill" shows once. Watch RADV for BC3 flashes (the submit once hid a race there).
+
 ### FRITCHII_VA_REPORT
 
 TEST tool, off by default (helper FJ, 2026-11-19). Boot: 1 = the instance enables VK_EXT_debug_utils

@@ -489,6 +489,10 @@ bool IsRecord(SeamHook::Use use) {
 // ---------------------------------------------------------------------------------------------
 // The hook
 
+bool SeamHook::Holding() noexcept {
+    return t_holding;
+}
+
 void SeamHook::OnUse(Use use, const std::source_location& location) {
     if (Link::OnStageThread()) [[unlikely]] {
         // The scheduler and the descriptor queues are the back's (spec 5.5): must be 0.
